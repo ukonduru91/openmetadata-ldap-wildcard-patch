@@ -165,6 +165,10 @@ One file: `openmetadata-service/.../security/auth/LdapAuthenticator.java`.
 Nothing environment-specific is hardcoded; every value still comes from the LDAP
 configuration you set in the UI.
 
+**See [CODE-CHANGES.md](CODE-CHANGES.md)** for a hunk-by-hunk walkthrough: the exact before
+and after for all seven hunks, why each approach was chosen over the alternatives, and what
+was deliberately left alone.
+
 ---
 
 ## Deploy
