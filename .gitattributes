@@ -1,0 +1,4 @@
+# the build script runs on Linux/macOS - CRLF would break the shebang
+*.sh        text eol=lf
+# never let git rewrite line endings inside a patch file
+*.patch     -text

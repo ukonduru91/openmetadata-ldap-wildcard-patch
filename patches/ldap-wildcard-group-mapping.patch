@@ -1,0 +1,212 @@
+diff --git a/openmetadata-service/src/main/java/org/openmetadata/service/security/auth/LdapAuthenticator.java b/openmetadata-service/src/main/java/org/openmetadata/service/security/auth/LdapAuthenticator.java
+index edad29c4..c086796f 100644
+--- a/openmetadata-service/src/main/java/org/openmetadata/service/security/auth/LdapAuthenticator.java
++++ b/openmetadata-service/src/main/java/org/openmetadata/service/security/auth/LdapAuthenticator.java
+@@ -39,12 +39,16 @@ import java.security.GeneralSecurityException;
+ import java.time.Instant;
+ import java.util.ArrayList;
+ import java.util.LinkedHashMap;
++import java.util.LinkedHashSet;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Objects;
+ import java.util.Set;
+ import java.util.UUID;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.ConcurrentMap;
+ import java.util.function.Function;
++import java.util.regex.Pattern;
+ import java.util.stream.Collectors;
+ import lombok.extern.slf4j.Slf4j;
+ import org.openmetadata.common.utils.CommonUtil;
+@@ -91,6 +95,11 @@ public class LdapAuthenticator implements AuthenticatorHandler {
+   private LDAPConnectionPool ldapLookupConnectionPool;
+   private boolean isSelfSignUpEnabled;
+ 
++  private static final String REQUIRE_GROUP_ENV = "OPENMETADATA_LDAP_REQUIRE_GROUP";
++
++  private static final ConcurrentMap<String, Pattern> DN_PATTERN_CACHE =
++      new ConcurrentHashMap<>();
++
+   @Override
+   public void init(OpenMetadataApplicationConfig config) {
+     if (SecurityConfigurationManager.getCurrentAuthConfig().getProvider().equals(AuthProvider.LDAP)
+@@ -279,6 +288,7 @@ public class LdapAuthenticator implements AuthenticatorHandler {
+     if (!nullOrEmpty(userDN)) {
+       User dummy = getUserForLdap(email);
+       validatePassword(userDN, pwd, dummy);
++      enforceGroupMembership(userDN, email);
+       return checkAndCreateUser(userDN, email, dummy.getName());
+     }
+ 
+@@ -286,6 +296,45 @@ public class LdapAuthenticator implements AuthenticatorHandler {
+         INTERNAL_SERVER_ERROR, INVALID_USER_OR_PASSWORD, INVALID_EMAIL_PASSWORD);
+   }
+ 
++  /**
++   * Optional login gate. When OPENMETADATA_LDAP_REQUIRE_GROUP=true a user must match the
++   * configured group search to be let in; otherwise login is refused even though the bind
++   * succeeded. Disabled by default so existing deployments are unaffected.
++   */
++  private void enforceGroupMembership(String userDn, String email) {
++    if (!Boolean.parseBoolean(System.getenv(REQUIRE_GROUP_ENV))) {
++      return;
++    }
++    int groupCount;
++    try {
++      Filter groupFilter =
++          createGroupAttributeFilter(
++              ldapConfiguration.getGroupAttributeName(),
++              ldapConfiguration.getGroupAttributeValue());
++      Filter groupMemberAttr =
++          Filter.createEqualityFilter(ldapConfiguration.getGroupMemberAttributeName(), userDn);
++      SearchRequest searchRequest =
++          new SearchRequest(
++              ldapConfiguration.getGroupBaseDN(),
++              SearchScope.SUB,
++              Filter.createANDFilter(groupFilter, groupMemberAttr),
++              ldapConfiguration.getAllAttributeName());
++      groupCount = ldapLookupConnectionPool.search(searchRequest).getSearchEntries().size();
++    } catch (Exception ex) {
++      // The bind already succeeded, so the directory is reachable. A failure here is not a
++      // reason to let someone in.
++      LOG.error("[LDAP] Group membership check errored for {}; denying login", email, ex);
++      throw new CustomExceptionMessage(
++          FORBIDDEN, INVALID_USER_OR_PASSWORD, INVALID_EMAIL_PASSWORD);
++    }
++    if (groupCount == 0) {
++      LOG.info(
++          "[LDAP] Login denied for {}: no group matches the configured group filter", email);
++      throw new CustomExceptionMessage(
++          FORBIDDEN, INVALID_USER_OR_PASSWORD, INVALID_EMAIL_PASSWORD);
++    }
++  }
++
+   private String getUserDnFromLdap(String email) {
+     // Retry configuration (will be made configurable in future)
+     final int maxRetries = 3;
+@@ -394,7 +443,7 @@ public class LdapAuthenticator implements AuthenticatorHandler {
+     // Get user's groups from LDAP server using the DN of the user
+     try {
+       Filter groupFilter =
+-          Filter.createEqualityFilter(
++          createGroupAttributeFilter(
+               ldapConfiguration.getGroupAttributeName(),
+               ldapConfiguration.getGroupAttributeValue());
+       Filter groupMemberAttr =
+@@ -427,25 +476,21 @@ public class LdapAuthenticator implements AuthenticatorHandler {
+       // match the user's ldap groups with the role mapping according to groupDN
+       for (SearchResultEntry searchResultEntry : searchResult.getSearchEntries()) {
+         String groupDN = searchResultEntry.getDN();
+-        if (roleMapping.containsKey(groupDN)
+-            && !CollectionUtils.isEmpty(roleMapping.get(groupDN))) {
+-          List<String> roles = roleMapping.get(groupDN);
+-          for (String roleName : roles) {
+-            if (ldapConfiguration.getRoleAdminName().equals(roleName)) {
+-              adminFlag = Boolean.TRUE;
+-            } else {
+-              // Check if the role exists in OM Database
+-              try {
+-                Role roleOm =
+-                    roleRepository.getByName(null, roleName, roleRepository.getFields("id,name"));
+-                EntityReference entityReference = new EntityReference();
+-                BeanUtils.copyProperties(roleOm, entityReference);
+-                entityReference.setType(Entity.ROLE);
+-                roleReferenceList.add(entityReference);
+-              } catch (EntityNotFoundException ex) {
+-                // Role does not exist
+-                LOG.error("Role {} does not exist in OM Database", roleName);
+-              }
++        for (String roleName : resolveMappedRoles(roleMapping, groupDN)) {
++          if (roleName.equals(ldapConfiguration.getRoleAdminName())) {
++            adminFlag = Boolean.TRUE;
++          } else {
++            // Check if the role exists in OM Database
++            try {
++              Role roleOm =
++                  roleRepository.getByName(null, roleName, roleRepository.getFields("id,name"));
++              EntityReference entityReference = new EntityReference();
++              BeanUtils.copyProperties(roleOm, entityReference);
++              entityReference.setType(Entity.ROLE);
++              roleReferenceList.add(entityReference);
++            } catch (EntityNotFoundException ex) {
++              // Role does not exist
++              LOG.error("Role {} does not exist in OM Database", roleName);
+             }
+           }
+         }
+@@ -474,6 +519,74 @@ public class LdapAuthenticator implements AuthenticatorHandler {
+     }
+   }
+ 
++  /**
++   * Builds the group-selecting filter. A '*' in the configured value is treated as a glob and
++   * compiled to an LDAP substring filter; a bare "*" becomes a presence filter. Values with no
++   * '*' keep the original equality behaviour.
++   */
++  private static Filter createGroupAttributeFilter(String attributeName, String attributeValue) {
++    if (attributeValue == null || attributeValue.indexOf('*') < 0) {
++      return Filter.createEqualityFilter(attributeName, attributeValue);
++    }
++    String[] parts = attributeValue.split("\\*", -1);
++    String subInitial = parts[0].isEmpty() ? null : parts[0];
++    String subFinal = parts[parts.length - 1].isEmpty() ? null : parts[parts.length - 1];
++    List<String> subAny = new ArrayList<>();
++    for (int i = 1; i < parts.length - 1; i++) {
++      if (!parts[i].isEmpty()) {
++        subAny.add(parts[i]);
++      }
++    }
++    if (subInitial == null && subFinal == null && subAny.isEmpty()) {
++      return Filter.createPresenceFilter(attributeName);
++    }
++    return Filter.createSubstringFilter(
++        attributeName, subInitial, subAny.toArray(new String[0]), subFinal);
++  }
++
++  /** Roles for a group DN: the exact mapping key, plus every wildcard key that matches it. */
++  private static Set<String> resolveMappedRoles(
++      Map<String, List<String>> roleMapping, String groupDN) {
++    Set<String> roles = new LinkedHashSet<>();
++    if (roleMapping == null) {
++      return roles;
++    }
++    for (Map.Entry<String, List<String>> entry : roleMapping.entrySet()) {
++      if (CollectionUtils.isEmpty(entry.getValue())) {
++        continue;
++      }
++      String key = entry.getKey();
++      boolean matched =
++          key.indexOf('*') < 0
++              ? key.equals(groupDN)
++              : DN_PATTERN_CACHE
++                  .computeIfAbsent(key, LdapAuthenticator::compileDnPattern)
++                  .matcher(groupDN)
++                  .matches();
++      if (matched) {
++        roles.addAll(entry.getValue());
++      }
++    }
++    return roles;
++  }
++
++  /** Translates a DN glob (only '*' is special) into an anchored, case-insensitive regex. */
++  private static Pattern compileDnPattern(String dnGlob) {
++    StringBuilder regex = new StringBuilder();
++    int start = 0;
++    for (int star = dnGlob.indexOf('*'); star >= 0; star = dnGlob.indexOf('*', start)) {
++      if (star > start) {
++        regex.append(Pattern.quote(dnGlob.substring(start, star)));
++      }
++      regex.append(".*");
++      start = star + 1;
++    }
++    if (start < dnGlob.length()) {
++      regex.append(Pattern.quote(dnGlob.substring(start)));
++    }
++    return Pattern.compile(regex.toString(), Pattern.CASE_INSENSITIVE);
++  }
++
+   /**
+    * Check if user should be admin based on adminPrincipals configuration
+    */

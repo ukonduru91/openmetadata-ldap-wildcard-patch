@@ -1,0 +1,5 @@
+# build scratch
+.build/
+
+# built artifacts - attach these to GitHub Releases instead of committing them
+dist/*.jar
